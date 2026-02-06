@@ -3,7 +3,7 @@ import numpy as np
 import yfinance as yf
 import matplotlib.pyplot as plt
 
-data = yf.download("MSTR", start="2018-01-01")
+data = yf.download("MSTR", start="2015-01-01")
 print(data.head())
 returns = np.log(data["Close"] / data["Close"].shift(1))
 returns = returns.dropna()
@@ -11,11 +11,11 @@ plt.figure()
 plt.plot(returns)
 plt.title("log returns")
 plt.show()
-rolling_vol = returns.rolling(window=365).std()
+rolling_vol = returns.rolling(window=2).std()
 
 plt.figure()
 plt.plot(rolling_vol)
-plt.title("Volatility Rolling (365 Days)")
+plt.title("Volatility Rolling (2 Days)")
 plt.show()
 
 from arch import arch_model
