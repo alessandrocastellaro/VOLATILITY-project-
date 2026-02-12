@@ -28,3 +28,234 @@ plt.title("MSTR Price")
 plt.xlabel("Time")
 plt.ylabel("Price")
 plt.show()
+
+
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Feb 11 23:28:21 2026
+
+@author: aless
+"""
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+# =========================================================
+# SETTINGS
+# =========================================================
+ticker = "USO"                 # oil ETF proxy (liquid, realistic execution)
+interval = "5m"                # try "1m" if it works, else 5m is more stable
+period = "60d"                 # intraday history window
+side = "BUY"                   # "BUY" or "SELL"
+Q = 20000                      # total shares to execute
+n_slices = 40                  # number of child orders
+spread_bps = 1.5               # fixed spread cost proxy (bps)
+fee_bps = 0.2                  # fees (bps) optional
+seed = 7
+
+# Impact model parameters (simple but interview-friendly)
+eta = 0.15      # temporary impact strength
+gamma = 0.02    # permanent impact strength
+noise_sigma = 0.6  # noise multiplier for randomness in fills
+
+np.random.seed(seed)
+
+# =========================================================
+# 1) DOWNLOAD INTRADAY DATA
+# =========================================================
+df = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
+
+if df.empty:
+    raise ValueError("No intraday data returned. Try interval='15m' or a different ticker (GLD).")
+
+# Keep regular trading hours-ish (Yahoo timestamps already local exchange time; we keep all rows returned)
+df = df.dropna()
+df["mid"] = (df["High"] + df["Low"]) / 2.0
+df["ret"] = np.log(df["mid"]).diff()
+
+# =========================================================
+# 2) BUILD VWAP WEIGHTS (volume profile)
+# =========================================================
+# Use intraday volume as proxy for market volume
+vol = df["Volume"].replace(0, np.nan).fillna(method="ffill").fillna(1.0).to_numpy()
+mid = df["mid"].to_numpy()
+
+T = len(df)
+if T < n_slices + 5:
+    raise ValueError("Not enough bars for chosen n_slices. Reduce n_slices or increase period.")
+
+# We'll execute over the last chunk of the sample
+exec_idx = np.arange(T - n_slices, T)   # use last n_slices bars
+mid_exec = mid[exec_idx]
+vol_exec = vol[exec_idx]
+
+# Benchmark prices
+p0 = mid_exec[0]
+vwap_bench = np.sum(mid_exec * vol_exec) / np.sum(vol_exec)
+
+# =========================================================
+# 3) SCHEDULES: TWAP / VWAP / IS (risk-aware)
+# =========================================================
+direction = 1.0 if side.upper() == "BUY" else -1.0
+
+# TWAP: equal slices
+q_twap = np.full(n_slices, Q / n_slices)
+
+# VWAP: proportional to volume in window
+w = vol_exec / np.sum(vol_exec)
+q_vwap = Q * w
+
+# IS-style schedule: more aggressive early when volatility is high / risk aversion
+# We'll make a convex schedule using an exponential decay weight (simple proxy)
+# Higher "lambda" => front-load more (reduce price risk at cost of impact)
+risk_aversion = 2.0
+t = np.linspace(0, 1, n_slices)
+weights = np.exp(-risk_aversion * t)
+weights = weights / weights.sum()
+q_is = Q * weights
+
+def normalize_and_round(q):
+    q = np.maximum(q, 0)
+    q = q / q.sum() * Q
+    q_int = np.floor(q).astype(int)
+    # allocate remaining shares
+    rem = Q - q_int.sum()
+    if rem > 0:
+        idx = np.argsort(-(q - q_int))[:rem]
+        q_int[idx] += 1
+    return q_int
+
+q_twap = normalize_and_round(q_twap)
+q_vwap = normalize_and_round(q_vwap)
+q_is   = normalize_and_round(q_is)
+
+# =========================================================
+# 4) EXECUTION SIMULATOR (impact + spread + noise)
+# =========================================================
+def simulate_execution(q_schedule, mid_path, vol_path):
+    """
+    Returns:
+      avg_fill: average executed price
+      fills: array of fill prices per slice
+      costs_bps: implementation shortfall vs p0 (bps, signed for BUY/SELL)
+    """
+    fills = np.zeros_like(q_schedule, dtype=float)
+    remaining = Q
+    perm_shift = 0.0  # permanent impact accumulates
+
+    # proxies for liquidity scaling
+    # higher volume => lower impact
+    vol_scale = np.sqrt(vol_path / np.nanmedian(vol_path))
+
+    for i, qi in enumerate(q_schedule):
+        if qi <= 0:
+            continue
+
+        # participation rate proxy (child size relative to volume)
+        pr = qi / max(vol_path[i], 1.0)
+
+        # temporary impact (worse when pr high, better when volume high)
+        temp_impact = eta * pr / max(vol_scale[i], 0.5)
+
+        # permanent impact accumulates with signed flow
+        perm_impact = gamma * (qi / Q)
+        perm_shift += direction * perm_impact
+
+        # spread + fees in price terms
+        spread_cost = (spread_bps / 1e4) * mid_path[i]
+        fee_cost    = (fee_bps / 1e4) * mid_path[i]
+
+        # random fill noise
+        noise = np.random.normal(0, noise_sigma) * (abs(df["ret"].dropna().std()) * mid_path[i])
+
+        # Fill price: mid + signed impact + spread (buy pays up, sell hits down)
+        fill = mid_path[i] * (1 + perm_shift) + direction * (temp_impact * mid_path[i]) + direction * spread_cost + fee_cost + noise
+        fills[i] = fill
+        remaining -= qi
+
+    avg_fill = np.sum(fills * q_schedule) / Q
+
+    # Implementation shortfall vs initial mid p0
+    # For BUY: higher fill is worse => positive cost
+    # For SELL: lower fill is worse => positive cost as well using direction
+    is_cost = direction * (avg_fill - p0) / p0
+    costs_bps = is_cost * 1e4
+
+    return avg_fill, fills, costs_bps
+
+def run_strategy(name, q_sched):
+    avg_fill, fills, cost_bps = simulate_execution(q_sched, mid_exec, vol_exec)
+    return {
+        "Algo": name,
+        "AvgFill": avg_fill,
+        "P0": p0,
+        "VWAP_Benchmark": vwap_bench,
+        "IS_cost_bps_vs_P0": cost_bps,
+        "Slippage_bps_vs_VWAP": (direction * (avg_fill - vwap_bench) / vwap_bench) * 1e4,
+        "Schedule": q_sched,
+        "Fills": fills
+    }
+
+res_twap = run_strategy("TWAP", q_twap)
+res_vwap = run_strategy("VWAP", q_vwap)
+res_is   = run_strategy("ImplementationShortfall", q_is)
+
+results = pd.DataFrame([
+    {k: v for k, v in res_twap.items() if k not in ["Schedule", "Fills"]},
+    {k: v for k, v in res_vwap.items() if k not in ["Schedule", "Fills"]},
+    {k: v for k, v in res_is.items() if k not in ["Schedule", "Fills"]},
+])
+
+print("\n===== Execution Summary =====")
+print(f"{ticker} | side={side} | Q={Q} shares | interval={interval} | slices={n_slices}")
+print(results.to_string(index=False))
+
+# =========================================================
+# 5) PLOTS (desk-ready)
+# =========================================================
+# Price path + executed fills
+plt.figure()
+plt.plot(df.index[exec_idx], mid_exec, label="Mid price")
+plt.scatter(df.index[exec_idx], res_twap["Fills"], s=12, label="TWAP fills")
+plt.scatter(df.index[exec_idx], res_vwap["Fills"], s=12, label="VWAP fills")
+plt.scatter(df.index[exec_idx], res_is["Fills"],   s=12, label="IS fills")
+plt.title(f"{ticker} - Execution Window: Mid vs Fill Prices")
+plt.xlabel("Time")
+plt.ylabel("Price")
+plt.legend()
+plt.show()
+
+# Schedules
+plt.figure()
+plt.plot(res_twap["Schedule"], label="TWAP schedule")
+plt.plot(res_vwap["Schedule"], label="VWAP schedule")
+plt.plot(res_is["Schedule"], label="IS schedule")
+plt.title("Child Order Sizes by Slice")
+plt.xlabel("Slice")
+plt.ylabel("Shares")
+plt.legend()
+plt.show()
+
+# Cost distribution via Monte Carlo (repeat runs)
+def mc_costs(q_sched, n=200):
+    costs = []
+    for _ in range(n):
+        avg_fill, _, cost_bps = simulate_execution(q_sched, mid_exec, vol_exec)
+        costs.append(cost_bps)
+    return np.array(costs)
+
+mc_twap = mc_costs(q_twap, n=250)
+mc_vwap = mc_costs(q_vwap, n=250)
+mc_is   = mc_costs(q_is,   n=250)
+
+plt.figure()
+plt.hist(mc_twap, bins=40, density=True, alpha=0.7, label="TWAP")
+plt.hist(mc_vwap, bins=40, density=True, alpha=0.7, label="VWAP")
+plt.hist(mc_is,   bins=40, density=True, alpha=0.7, label="IS")
+plt.title("Execution Cost Density (bps vs P0) — Monte Carlo")
+plt.xlabel("Cost (bps)")
+plt.ylabel("Density")
+plt.legend()
+plt.show()
