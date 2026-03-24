@@ -1,0 +1,412 @@
+"""
+Polymarket BTC Up/Down 5m Bot — DEFINITIVO
+===========================================
+Run in Spyder: F5
+"""
+from __future__ import annotations
+import json, queue, threading, tkinter as tk
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from tkinter.scrolledtext import ScrolledText
+from typing import Optional
+import requests
+
+# ══════════════════════════════════════════
+#  CONFIG
+# ══════════════════════════════════════════
+MODE           = "paper"
+THRESHOLD_BUY  = 0.48
+THRESHOLD_SELL = 0.52
+STAKE_USDC     = 5.0
+POLL_SECONDS   = 6
+# ══════════════════════════════════════════
+
+GAMMA = "https://gamma-api.polymarket.com"
+
+
+@dataclass
+class Market:
+    slug:       str
+    title:      str
+    end_time:   datetime
+    up_token:   str
+    down_token: str
+    up_price:   float = 0.0
+    down_price: float = 0.0
+
+
+def find_market() -> Optional[Market]:
+    now  = datetime.now(timezone.utc)
+    secs = int(now.timestamp())
+    base = (secs // 300) * 300
+
+    for ts in [base - 300, base, base + 300, base + 600, base + 900]:
+        slug = f"btc-updown-5m-{ts}"
+        try:
+            r    = requests.get(f"{GAMMA}/events", params={"slug": slug}, timeout=10)
+            data = r.json()
+        except Exception:
+            continue
+
+        if not data:
+            continue
+
+        ev  = data[0]
+        end = ev.get("endDate") or ""
+        try:
+            end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        except Exception:
+            continue
+
+        if end_dt <= now:
+            continue
+
+        # ← dati dentro markets[0]
+        markets = ev.get("markets") or []
+        if not markets:
+            continue
+        m = markets[0]
+
+        tok_raw = m.get("clobTokenIds") or "[]"
+        tokens  = json.loads(tok_raw) if isinstance(tok_raw, str) else tok_raw
+
+        out_raw  = m.get("outcomes") or "[]"
+        outcomes = json.loads(out_raw) if isinstance(out_raw, str) else out_raw
+
+        pr_raw = m.get("outcomePrices") or "[]"
+        prices = [float(x) for x in (json.loads(pr_raw) if isinstance(pr_raw, str) else pr_raw)]
+
+        up_tok = down_tok = ""
+        up_p   = down_p   = 0.0
+        for i, o in enumerate(outcomes):
+            name = str(o).upper()
+            if "UP" in name and i < len(tokens):
+                up_tok = tokens[i]
+                up_p   = prices[i] if i < len(prices) else 0.0
+            elif "DOWN" in name and i < len(tokens):
+                down_tok = tokens[i]
+                down_p   = prices[i] if i < len(prices) else 0.0
+
+        if not up_tok or not down_tok:
+            continue
+
+        return Market(slug=slug, title=ev.get("title") or slug,
+                      end_time=end_dt,
+                      up_token=up_tok, down_token=down_tok,
+                      up_price=up_p,   down_price=down_p)
+
+    return None
+
+
+def get_prices(mkt: Market) -> tuple[float, float]:
+    try:
+        r    = requests.get(f"{GAMMA}/events", params={"slug": mkt.slug}, timeout=8)
+        data = r.json()
+        if not data:
+            return mkt.up_price, mkt.down_price
+
+        ev = data[0]
+        markets = ev.get("markets") or []
+        if not markets:
+            return mkt.up_price, mkt.down_price
+        m = markets[0]
+
+        # prefer bestBid/bestAsk midpoint
+        bid = m.get("bestBid")
+        ask = m.get("bestAsk")
+        if bid is not None and ask is not None:
+            up_p = (float(bid) + float(ask)) / 2
+            return round(up_p, 4), round(1 - up_p, 4)
+
+        # fallback outcomePrices
+        pr_raw  = m.get("outcomePrices") or "[]"
+        prices  = [float(x) for x in (json.loads(pr_raw) if isinstance(pr_raw, str) else pr_raw)]
+        out_raw = m.get("outcomes") or "[]"
+        outcomes = json.loads(out_raw) if isinstance(out_raw, str) else out_raw
+
+        up_p = down_p = 0.0
+        for i, o in enumerate(outcomes):
+            if "UP" in str(o).upper() and i < len(prices):
+                up_p = prices[i]
+            elif "DOWN" in str(o).upper() and i < len(prices):
+                down_p = prices[i]
+
+        if up_p == 0 and down_p > 0:
+            up_p = round(1 - down_p, 4)
+        if down_p == 0 and up_p > 0:
+            down_p = round(1 - up_p, 4)
+
+        return up_p, down_p
+
+    except Exception:
+        return mkt.up_price, mkt.down_price
+
+
+# ── Engine ────────────────────────────────────
+
+@dataclass
+class Position:
+    side:        str
+    entry_price: float
+    shares:      float
+
+@dataclass
+class State:
+    market:       Optional[Market]   = None
+    position:     Optional[Position] = None
+    realized_pnl: float = 0.0
+    trades:       int   = 0
+
+
+class Engine:
+    def __init__(self, log_cb, state_cb):
+        self._log   = log_cb
+        self._state = state_cb
+        self.state  = State()
+        self._stop  = threading.Event()
+
+    def stop(self): self._stop.set()
+
+    def log(self, msg, color="white"):
+        self._log(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", color)
+
+    def run(self):
+        self.log(f"Avviato | {MODE.upper()} | buy<{THRESHOLD_BUY} sell>{THRESHOLD_SELL} | ${STAKE_USDC}/trade", "cyan")
+        while not self._stop.is_set():
+            try:
+                self._tick()
+            except Exception as e:
+                self.log(f"Errore: {e}", "red")
+            self._stop.wait(POLL_SECONDS)
+        self.log("Fermato.", "yellow")
+
+    def _tick(self):
+        now = datetime.now(timezone.utc)
+
+        if self.state.market is None or self.state.market.end_time <= now:
+            self.log("Cerco mercato BTC 5m...", "yellow")
+            mkt = find_market()
+            if mkt is None:
+                self.log("Mercato non trovato. Riprovo...", "red")
+                self._stop.wait(10)
+                return
+            if self.state.market and self.state.position:
+                self._close(0.5, "rollover")
+            self.state.market = mkt
+            secs = int((mkt.end_time - now).total_seconds())
+            self.log(f"Mercato: {mkt.title}", "cyan")
+            self.log(f"UP={mkt.up_price:.3f}  DOWN={mkt.down_price:.3f}  scade in {secs}s", "cyan")
+
+        up, down = get_prices(self.state.market)
+        self.state.market.up_price   = up
+        self.state.market.down_price = down
+        secs = max(0, int((self.state.market.end_time - now).total_seconds()))
+        self.log(f"UP {up:.4f}  DOWN {down:.4f}  |  scade in {secs}s", "blue")
+
+        pos = self.state.position
+        if pos is None:
+            if up < THRESHOLD_BUY:
+                self._enter("UP", up)
+            elif up > THRESHOLD_SELL:
+                self._enter("DOWN", down)
+        else:
+            if pos.side == "UP"   and up   >= THRESHOLD_SELL:
+                self._close(up,   "target UP")
+            elif pos.side == "DOWN" and down >= THRESHOLD_SELL:
+                self._close(down, "target DOWN")
+            elif secs < 25:
+                self._close(up if pos.side == "UP" else down, "scadenza")
+
+        self._state(self.state)
+
+    def _enter(self, side, price):
+        shares = STAKE_USDC / price if price > 0 else 0
+        self.state.position = Position(side, price, shares)
+        self.state.trades  += 1
+        label = "BUY UP ↑" if side == "UP" else "BUY DOWN ↓"
+        self.log(f"{'[PAPER] ' if MODE=='paper' else ''}ENTRATA {label}  prezzo={price:.4f}  shares={shares:.2f}  ${STAKE_USDC}", "green")
+        self._state(self.state)
+
+    def _close(self, exit_price, reason):
+        pos = self.state.position
+        if not pos: return
+        pnl = (exit_price - pos.entry_price) * pos.shares
+        self.state.realized_pnl += pnl
+        color = "green" if pnl >= 0 else "red"
+        sign  = "+" if pnl >= 0 else ""
+        self.log(f"{'[PAPER] ' if MODE=='paper' else ''}USCITA {pos.side}  exit={exit_price:.4f}  PnL={sign}{pnl:.4f}  [{reason}]", color)
+        self.state.position = None
+        self._state(self.state)
+
+
+# ── GUI ───────────────────────────────────────
+
+class GUI:
+    BG=  "#0d0d0d"; CARD="#141414"
+    GRN= "#00ff88"; RED= "#ff3b3b"; DIM="#555555"
+
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title(f"Polymarket BTC 5m — {MODE.upper()}")
+        self.root.configure(bg=self.BG)
+        self.root.geometry("1100x800")
+        self._q = queue.Queue()
+        self.engine = self.worker = None
+        self._uh: list[float] = []
+        self._dh: list[float] = []
+        self._build()
+        self.root.after(200, self._drain)
+        self.root.protocol("WM_DELETE_WINDOW", self._quit)
+
+    def _build(self):
+        B,C,G,R,D = self.BG,self.CARD,self.GRN,self.RED,self.DIM
+
+        hdr = tk.Frame(self.root, bg=B, pady=10)
+        hdr.pack(fill=tk.X, padx=16)
+        tk.Label(hdr, text="◈ POLYMARKET HFT", bg=B, fg=G,
+                 font=("Courier New",17,"bold")).pack(side=tk.LEFT)
+        tk.Label(hdr, text=f"BTC UP/DOWN 5M  ·  {MODE.upper()}",
+                 bg=B, fg=D, font=("Courier New",11)).pack(side=tk.LEFT, padx=16)
+        self._status = tk.Label(hdr, text="● STOPPED", bg=B, fg=R,
+                                font=("Courier New",11,"bold"))
+        self._status.pack(side=tk.RIGHT)
+
+        ctrl = tk.Frame(self.root, bg=C, pady=8, padx=14)
+        ctrl.pack(fill=tk.X, padx=16, pady=(0,8))
+        btn = dict(font=("Courier New",11,"bold"), relief="flat", cursor="hand2", padx=16, pady=6)
+        self._bs = tk.Button(ctrl, text="▶  START ALGO", bg=G, fg="#000", command=self._start, **btn)
+        self._bs.pack(side=tk.LEFT)
+        self._bx = tk.Button(ctrl, text="■  STOP ALGO",  bg=R, fg="#fff", command=self._stop,
+                             state=tk.DISABLED, **btn)
+        self._bx.pack(side=tk.LEFT, padx=10)
+        tk.Label(ctrl, text=f"BUY UP < {THRESHOLD_BUY}  |  SELL > {THRESHOLD_SELL}  |  ${STAKE_USDC}/trade  |  ogni {POLL_SECONDS}s",
+                 bg=C, fg=D, font=("Courier New",10)).pack(side=tk.LEFT, padx=14)
+
+        stats = tk.Frame(self.root, bg=B)
+        stats.pack(fill=tk.X, padx=16, pady=(0,8))
+        self._vm = tk.StringVar(value="—")
+        self._vp = tk.StringVar(value="UP: —    DOWN: —")
+        self._vo = tk.StringVar(value="nessuna posizione")
+        self._vl = tk.StringVar(value="$0.00")
+        self._vt = tk.StringVar(value="0")
+        self._vs = tk.StringVar(value="—")
+
+        def card(lbl, var, acc=False):
+            f = tk.Frame(stats, bg=C, padx=12, pady=8)
+            f.pack(side=tk.LEFT, padx=4, fill=tk.BOTH, expand=True)
+            tk.Label(f, text=lbl, bg=C, fg=D, font=("Courier New",8)).pack(anchor="w")
+            tk.Label(f, textvariable=var, bg=C, fg=G if acc else "#dddddd",
+                     font=("Courier New",12,"bold")).pack(anchor="w")
+
+        card("MERCATO",        self._vm)
+        card("PREZZI",         self._vp, True)
+        card("POSIZIONE",      self._vo)
+        card("PnL REALIZZATO", self._vl, True)
+        card("TRADE",          self._vt)
+        card("SCADE TRA",      self._vs)
+
+        cf = tk.Frame(self.root, bg=C, padx=8, pady=6)
+        cf.pack(fill=tk.X, padx=16, pady=(0,8))
+        tk.Label(cf, text="GRAFICO  verde=UP  rosso=DOWN  giallo=soglia",
+                 bg=C, fg=D, font=("Courier New",9)).pack(anchor="w")
+        self._cv = tk.Canvas(cf, bg="#080808", height=130, highlightthickness=0)
+        self._cv.pack(fill=tk.X)
+
+        lf = tk.Frame(self.root, bg=C, padx=8, pady=6)
+        lf.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0,10))
+        tk.Label(lf, text="EVENT LOG", bg=C, fg=D, font=("Courier New",9)).pack(anchor="w")
+        self._log = ScrolledText(lf, height=14, font=("Courier New",10),
+                                 bg="#080808", fg="#cccccc", insertbackground="#fff",
+                                 relief="flat", borderwidth=0)
+        self._log.pack(fill=tk.BOTH, expand=True)
+        for t,c in [("green","#00ff88"),("red","#ff3b3b"),("blue","#4fc3f7"),
+                    ("yellow","#ffd54f"),("cyan","#80deea"),("white","#cccccc")]:
+            self._log.tag_config(t, foreground=c)
+        self._log.configure(state=tk.DISABLED)
+
+    def _start(self):
+        if self.worker and self.worker.is_alive(): return
+        self.engine = Engine(
+            log_cb   = lambda t,c: self._q.put(("log",t,c)),
+            state_cb = lambda s:   self._q.put(("state",s)),
+        )
+        self.worker = threading.Thread(target=self.engine.run, daemon=True)
+        self.worker.start()
+        self._bs.configure(state=tk.DISABLED)
+        self._bx.configure(state=tk.NORMAL)
+        self._status.configure(text="● RUNNING", fg=self.GRN)
+
+    def _stop(self):
+        if self.engine: self.engine.stop()
+        self._bs.configure(state=tk.NORMAL)
+        self._bx.configure(state=tk.DISABLED)
+        self._status.configure(text="● STOPPED", fg=self.RED)
+
+    def _quit(self):
+        self._stop()
+        self.root.after(200, self.root.destroy)
+
+    def _drain(self):
+        while not self._q.empty():
+            item = self._q.get_nowait()
+            if item[0] == "log":   self._wlog(item[1], item[2])
+            elif item[0]=="state": self._apply(item[1])
+        self.root.after(200, self._drain)
+
+    def _wlog(self, text, color):
+        self._log.configure(state=tk.NORMAL)
+        tag = color if color in ("green","red","blue","yellow","cyan") else "white"
+        self._log.insert(tk.END, text+"\n", tag)
+        self._log.see(tk.END)
+        self._log.configure(state=tk.DISABLED)
+
+    def _apply(self, s: State):
+        now = datetime.now(timezone.utc)
+        if s.market:
+            self._vm.set(s.market.title[:55])
+            self._vp.set(f"UP: {s.market.up_price:.4f}    DOWN: {s.market.down_price:.4f}")
+            secs = max(0, int((s.market.end_time - now).total_seconds()))
+            self._vs.set(f"{secs}s")
+            if s.market.up_price   > 0: self._uh.append(s.market.up_price)
+            if s.market.down_price > 0: self._dh.append(s.market.down_price)
+            self._uh = self._uh[-80:]; self._dh = self._dh[-80:]
+            self._draw()
+        else:
+            self._vm.set("ricerca...")
+
+        self._vo.set(f"{s.position.side} @ {s.position.entry_price:.4f}  {s.position.shares:.2f} shares"
+                     if s.position else "nessuna posizione")
+        sign = "+" if s.realized_pnl >= 0 else ""
+        self._vl.set(f"{sign}${s.realized_pnl:.4f}")
+        self._vt.set(str(s.trades))
+
+    def _draw(self):
+        c = self._cv; c.delete("all")
+        w = c.winfo_width(); h = c.winfo_height()
+        if w < 10 or h < 10: return
+        for v, col in [(0.25,"#1a1a1a"),(0.48,"#333"),(0.52,"#333"),(0.75,"#1a1a1a")]:
+            y = h - int(v*h)
+            c.create_line(0,y,w,y, fill=col, dash=(4,4))
+            c.create_text(4,y-6, text=f"{v:.2f}", fill="#444",
+                          font=("Courier New",7), anchor="w")
+        def line(hist, col):
+            if len(hist)<2: return
+            n=len(hist); pts=[]
+            for i,v in enumerate(hist):
+                pts += [int(i/(n-1)*w), h-int(v*h)]
+            c.create_line(*pts, fill=col, width=2, smooth=True)
+        line(self._uh, "#00ff88")
+        line(self._dh, "#ff3b3b")
+        yt = h-int(THRESHOLD_BUY*h)
+        c.create_line(0,yt,w,yt, fill="#ffd54f", dash=(6,3))
+        c.create_text(w-4,yt-7, text=f"soglia {THRESHOLD_BUY}",
+                      fill="#ffd54f", font=("Courier New",7), anchor="e")
+        if self._uh:
+            yd = h-int(self._uh[-1]*h)
+            c.create_oval(w-7,yd-7,w+7,yd+7, fill="#00ff88", outline="")
+
+    def run(self): self.root.mainloop()
+
+
+if __name__ == "__main__":
+    GUI().run()
